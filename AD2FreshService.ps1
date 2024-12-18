@@ -1,3 +1,43 @@
+<#
+ .SYNOPSIS
+ Azure Automation script that adds and updates Service Accounts from Active Directory into Freshservice CMDB.
+
+ .DESCRIPTION
+ Collects the following information from Freshservice and AD to add or update Service Accounts into Freshservice CMDB.
+
+ From Freshservice:
+    - All Assets
+    - Requesters
+    - Agents
+    - Departments
+    - Service Accounts
+
+ From AD:
+    - User Manager
+    - User PasswordLastSet
+    - USer Description
+    - User WhenCreated
+    - User UPN
+    - User SAM
+    - User Department
+    - User First Name
+    - User Last Name
+
+ .EXAMPLE
+ This script is non-interactive with no supported parameters
+ 
+ .INPUTS
+ This script contains no predefined inputs
+
+ .OUTPUTS
+ This script contains no additional outputs
+#>
+
+<#
+ Updates:
+	Version     Date		 Updated by			 Description
+	1.0			12.04.24     Jake Darcy         Initial Script 
+#>
 
 $StartTime = Get-Date
 
@@ -25,12 +65,12 @@ try {
     $FS_URL = Get-AutomationVariable -Name "FS_URL"
 }
 catch {
-    Write-Warning "WARNING: Failed to get Freshservice credentials from Automation account:" $_
+    Write-Warning ("WARNING: Failed to get Freshservice credentials from Automation account:" + $_)
     Write-Output "- Loading Freshservice credentials from server locally..."
     # Load encrypted credentials for Freshservice
-    $FS_KeyFile = "C:"
+    $FS_KeyFile = "C:\scripts\creds\"
     $FS_Key = Get-Content $FS_KeyFile
-    $FS_Encrypted_Key = Get-Content "C:\" | ConvertTo-SecureString -Key $FS_Key
+    $FS_Encrypted_Key = Get-Content "C:\Scripts\Creds\" | ConvertTo-SecureString -Key $FS_Key
     $FS_Cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $FS_Encrypted_Key, $FS_Encrypted_Key
     $FS_URL = "https://domain.freshservice.com"
 }
@@ -53,9 +93,9 @@ catch {
     Write-Output "- Loading Email credentials from server locally..."
     # Load encrypted credentials for svc_automation to send email
     $EMAIL_UN = ""
-    $SA_KeyFile = "C:\"
+    $SA_KeyFile = "C:\scripts\creds\"
     $SA_Key = Get-Content $SA_KeyFile
-    $SA_Encrypted_Key = Get-Content "C:\" | ConvertTo-SecureString -Key $SA_Key
+    $SA_Encrypted_Key = Get-Content "C:\Scripts\Creds\" | ConvertTo-SecureString -Key $SA_Key
     $EMAIL_Cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $EMAIL_UN, $SA_Encrypted_Key
 }
 
@@ -91,6 +131,7 @@ if ($Requesters) {
 else {
     Write-Error "ERROR: Failed to retreive requesters from Freshservice"
 }
+
 
 #========#
 # Agents #
@@ -152,21 +193,52 @@ else {
     Write-Error "ERROR: Failed to retreive departments from Freshservice"
 }
 
+##########################
+##  Service Accounts    ##
+##########################
+
+Write-Output "- Getting service accounts from Freshservice..."
+$URL_Assets = "$FS_URL/api/v2/assets?&include=type_fields&query="
+# array for the retuned service accounts to go into 
+$FS_SVCAccounts = @()
+do {
+    try {
+        $FS_ServiceAccounts = Invoke-WebRequest -Method GET -Headers $FS_HTTPHeaders -Uri $URL_Assets -UseBasicParsing -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Error "StatusCode:" $_.Exception.Response.StatusCode.value 
+        Write-Error "StatusDescription:" $_.Exception
+    } 
+    $ServiceAccountObjects = $FS_ServiceAccounts.Content | ConvertFrom-Json
+    $FS_SVCAccounts += $ServiceAccountObjects.assets
+ 
+    # get next page of objects
+    $URL_Assets = [regex]::Match($FS_ServiceAccounts.Headers.link, '\<(.*)\>').Groups[1].Value
+}
+while ($URL_Assets)
+
+if ($FS_SVCAccounts) {
+    Write-Output "- Received $($FS_SVCAccounts.count) Service Accounts from Freshservice"
+}
+else {
+    Write-Error "ERROR: Failed to retreive Servicee Accounts from Freshservice"
+}
+
 #####################################################################################################################################################
 
 ##########################################
 ##  Get Service Account Info From AD    ##
 ##########################################
 
-$ServiceAccounts = @()
-$ServiceAccounts += Get-ADUser -Filter 'enabled -eq $true' -SearchBase "OU=" -SearchScope Subtree -Properties manager, passwordlastset, Description, whenCreated | Select-Object manager, distinguishedname, GivenName, passwordlastset, UserPrincipalName, SamAccountName, description, whenCreated
+$ServiceAccountsAD = @()
+$ServiceAccountsAD += Get-ADUser -Filter 'enabled -eq $true' -SearchBase "OU=" -SearchScope Subtree -Properties manager, passwordlastset, Description, whenCreated | Select-Object manager, distinguishedname, GivenName, passwordlastset, UserPrincipalName, SamAccountName, description, whenCreated
 
+#$ServiceAccountsAD = $null
+#Uncomment for testing a single account and comment out the line above
+#$ServiceAccountsAD += Get-ADUser -Filter "(UserPrincipalName -eq '')" -Properties manager, passwordlastset, Description, whenCreated | Select-Object manager, distinguishedname, GivenName, passwordlastset, UserPrincipalName, SamAccountName, description, whenCreated
 
-#Un comment for testing a single account and comment out the line above
-#$ServiceAccounts += Get-ADUser -Filter "(UserPrincipalName -eq '')" -Properties manager, passwordlastset, Description, whenCreated | Select-Object manager, distinguishedname, GivenName, passwordlastset, UserPrincipalName, SamAccountName, description, whenCreated
-
-$ServiceAccountInfo = @()
-foreach ($Account in $ServiceAccounts){
+$ServiceAccountADInfo = @()
+foreach ($Account in $ServiceAccountsAD){
     $SAN = $Account.SamAccountName
     $LastPassReset = $Account.passwordlastset
     $Description = $Account.description
@@ -178,15 +250,15 @@ foreach ($Account in $ServiceAccounts){
 
 
     # set attributes from FS
-    $FS_Manager = $Requesters | ?{$Manager -eq $_.primary_email}
+    $FS_Manager = $FS_SVCAccounts | ?{$Manager -eq $_.primary_email}
     $FS_Manager_ID = $FS_Manager.id
-        if (!$Manager) {$FS_Manager_ID = xx}
+        if (!$Manager) {$FS_Manager_ID = 0000000}
         elseif ($FS_Manager.primary_email -notcontains $Manager){
                 $FS_Manager = $Agents | ?{$Manager -eq $_.email}
                 $FS_Manager_ID = $FS_Manager.id}
     $FS_Department = $Departments | ?{$Department -eq $_.name}
     $FS_Department_ID = $FS_Department.id
-        if (!$FS_Department_ID) {$FS_Department_ID = xx}    
+        if (!$FS_Department_ID) {$FS_Department_ID = 0000000}    
 
     $Properties = [Ordered]@{
         'AssetType'         ="Service Account"
@@ -203,7 +275,7 @@ foreach ($Account in $ServiceAccounts){
         
     }
     $Object = New-Object -TypeName PSCustomObject -Property $Properties
-    $ServiceAccountInfo += $Object
+    $ServiceAccountADInfo += $Object
 
 
     $CreatedDate = $null
@@ -223,8 +295,8 @@ foreach ($Account in $ServiceAccounts){
 ##  Add Service Accounts to Freshservice    ##
 ##############################################
 
-$Url_Add = "$FSUrl/api/v2/assets"
-$ServiceAccountInfo | ForEach-Object{
+$Url_Add = "$FS_Url/api/v2/assets"
+$ServiceAccountADInfo | ForEach-Object{
     $SVC_Name = $_.SamAccountName
     $SVC_LastPassReset = $_.LastPasswordReset
     $SVC_Description = $_.Description
@@ -234,38 +306,69 @@ $ServiceAccountInfo | ForEach-Object{
 
 
     #make array of all service accounts in freshservice before this point
-    if(($Requesters.name -ne $SVC_Name)){
+    if(($FS_SVCAccounts.name -NotContains $SVC_Name)){
         Write-Output "- $SVC_Name will be added to Freshservice"
         $Attributes = @{}
         $SubAttributes = @{}
-        $SubAttributes.add($Fs_AssetState, 'Enabled')
-        $SubAttributes.add('original_created_at_', $SVC_CreatedDate)
-        $SubAttributes.add('last_password_reset_', $SVC_LastPassReset)
+        
         $Attributes.add('type_fields', $SubAttributes)
         $Attributes.add('name', $SVC_Name)
-        $Attributes.add('asset_type_id', $Fs_ServiceAccountAssetID)
+        $Attributes.add('asset_type_id', [int64]$Fs_ServiceAccountAssetID)
         $Attributes.add('description', $SVC_Description)
-        $Attributes.add('agent_id', $FS_ManagerID)
-        $Attributes.add('department_id', $FS_DeptID)
+        $Attributes.add('agent_id', [int64]$FS_ManagerID)
+        $Attributes.add('department_id', [int64]$FS_DeptID)
 
-        $JSON = $Attributes | ConvertTo-Json
-        Write-Output "- JSON used to add the requester:" $JSON
-        
+        $SubAttributes.add($Fs_AssetState, 'Enabled')
+        $SubAttributes.add('original_created_at_', $SVC_CreatedDate.ToString("yyyy-MM-ddTHH:mm:ssZ"))
+        $SubAttributes.add('last_password_reset_', $SVC_LastPassReset.ToString("yyyy-MM-ddTHH:mm:ssZ"))
+
+        Write-Output "Debug values:"
+        Write-Output "SVC_Name: $SVC_Name"
+        Write-Output "Fs_ServiceAccountAssetID: $Fs_ServiceAccountAssetID"
+        Write-Output "SVC_Description: $SVC_Description"
+        Write-Output "FS_ManagerID: $FS_ManagerID"
+        Write-Output "FS_DeptID: $FS_DeptID"
+        Write-Output "FS_AssetState: $Fs_AssetState"
+        Write-Output "SVC_CreatedDate: $SVC_CreatedDate"
+        Write-Output "SVC_LastPassReset: $SVC_LastPassReset"
+
+        $JSON = $Attributes | ConvertTo-Json -Depth 10
+        Write-Output "- JSON used to add the Service Account:" 
+        Write-Output $JSON
+      
+     
+ 
+
+        # Attempt to make the API call and add the Service account from AD
         try {
-            Invoke-WebRequest -Method post -Uri $URL_Add -Headers $FS_HTTPHeaders -Body $JSON -verbose -UseBasicParsing
-            Write-Output "- Successfully created $AD_fName $AD_lName <$AD_UPN>"
+            Write-Output "`nAttempting to create asset for $SVC_Name..."
+    
+            $response = Invoke-WebRequest -Method Post `
+                                        -Uri $URL_Add `
+                                        -Headers $FS_HTTPHeaders `
+                                        -Body $JSON `
+                                        -ContentType 'application/json' `
+                                        -UseBasicParsing
+    
+            Write-Output "Success! Response Status: $($response.StatusCode)"
+            Write-Output "Response Content:"
+            Write-Output $response.Content
+        } catch {
+            Write-Output "`nError occurred during API call:"
+            Write-Output "Status Code: $($_.Exception.Response.StatusCode.value__)"
+    
+            # Get the error response body
+            $errorResponse = $_.Exception.Response.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($errorResponse)
+            $errorBody = $reader.ReadToEnd()
+            Write-Output "`nError details from server:"
+            Write-Output $errorBody
         }
-        catch {
-            Write-Warning "WARNING: Failed to create $AD_fName $AD_lName <$AD_UPN>:" 
-            Write-Output $_
-            Write-Output "- StatusCode:" $_.Exception.Response.StatusCode.value 
-            Write-Output "- StatusDescription:" $_.Exception
-            $Errors += "<p>Failed to create <b>$AD_fName $AD_lName $AD_UPN</b> using JSON: <p> $JSON"
-        }
+
+       Write-Output "- Successfully created $SVC_Name"
 
         # clear variables
         $JSON = $Attributes = $SubAttributes = $null
 
-    }
-
+     }
 }
